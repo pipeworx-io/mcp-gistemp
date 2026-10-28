@@ -1,16 +1,28 @@
-# mcp-gistemp
+# @pipeworx/gistemp
 
-GISTEMP MCP — NASA Goddard Institute for Space Studies Surface Temperature Analysis (free, no auth)
+NASA GISS surface temperature anomalies (degrees C from the 1951-1980 baseline): global, hemispheric and zonal series, monthly and annual, with the latest reading ranked against history.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1877+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `get_temperature_anomaly` | NASA GISTEMP surface temperature anomaly time series (degrees C from 1951-1980 baseline). Pick a region (global_land_ocean, global_land_only, northern_hemisphere, southern_hemisphere) and get monthly + annual + seasonal values back. Use for climate bets ("will 2026 be the hottest year on record"), trend comparisons, or cross-source consistency checks against HadCRUT5/Berkeley Earth. Annual frequency returns one row per year (Jan-Dec mean); monthly returns Jan..Dec per year. |
-| `get_latest_anomaly` | Most recent NASA GISTEMP global land+ocean monthly anomaly, plus how it ranks against history. Returns the latest available month, the anomaly value (degrees C from 1951-1980 baseline), the rank of that value among all same-month observations since 1880, and a 12-month trailing mean. Cheaper than get_temperature_anomaly when you only need "what is the current reading and is it unusual." |
-| `get_zonal_anomalies` | NASA GISTEMP annual zonal anomalies (degrees C from 1951-1980 baseline) for 8 latitude bands: global, Northern Hemisphere, Southern Hemisphere, 24N-90N, 24S-24N (tropics), 90S-24S, 64N-90N (Arctic), 44S-24S, etc. Use for regional climate bets ("will the Arctic warm faster than the tropics in 2026") or bets framed around polar amplification. |
+- `get_temperature_anomaly(region?, frequency?, start_year?, end_year?)` - monthly or annual anomaly series for global land+ocean, global land only, or either hemisphere.
+- `get_latest_anomaly(region?)` - the most recent month, its rank among the same month since 1880, and a 12-month trailing mean.
+- `get_zonal_anomalies(start_year?, end_year?)` - annual anomalies by latitude band.
+
+## Auth
+
+Keyless.
+
+## Data sources
+
+- NASA Goddard Institute for Space Studies, GISTEMP surface temperature analysis (v4). US federal government work, public domain; no reuse grant is needed to store or serve it.
+
+## Stored copy
+
+NASA GISS refuses requests leaving some of our network egress, so calls are answered from a copy kept in the shared object store (five small tables plus a manifest, none in git and none in the gateway bundle). Every response carries `served_from` (`stored-copy`, `live`, or `stale-stored-copy`), `data_as_of` (latest observation month) and `copy_refreshed_at`. A copy older than 45 days sends the call to NASA first and falls back to the old copy, labelled, if NASA still refuses.
+
+Refresh: `node mcps/gistemp/scripts/refresh-gistemp.mjs` from a US machine (it checks its own country and refuses otherwise). NASA publishes about monthly. The manifest is written last and only when every table was read, so `copy_refreshed_at` never claims a check that did not happen.
 
 ## Quick Start
 
@@ -56,7 +68,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1879+ data sources. The
+Both URLs reach the same gateway and the same 1877+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

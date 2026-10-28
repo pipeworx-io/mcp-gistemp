@@ -943,7 +943,7 @@ async function parseJsonBounded<T>(
  * HadCRUT5 (UK Met) and Berkeley Earth — pair across sources for any
  * climate bet whose resolution rule names a specific provider.
  *
- * Source: https://data.giss.nasa.gov/gistemp/
+ * Source: NASA GISS, GISTEMP surface temperature analysis (US federal, public domain)
  * Tools:
  * - get_temperature_anomaly: monthly + annual anomaly time series for a region
  * - get_latest_anomaly:      most-recent month + rank-vs-history
@@ -955,8 +955,9 @@ async function parseJsonBounded<T>(
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
 // until its own execution budget kills the request (minutes, not seconds).
 // Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
+const UA = 'pipeworx-mcp-gistemp/1.0 (+https://pipeworx.io)';
 async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'GISTEMP');
+  return fetchWithTimeout(url, { ...(init ?? {}), headers: { 'User-Agent': UA, Accept: 'text/csv,*/*' } }, 'GISTEMP');
 }
 
 const BASE = 'https://data.giss.nasa.gov/gistemp/tabledata_v4';
@@ -967,6 +968,9 @@ const REGION_FILES: Record<string, string> = {
   northern_hemisphere: 'NH.Ts+dSST.csv',
   southern_hemisphere: 'SH.Ts+dSST.csv',
 };
+const ZONAL_FILE = 'ZonAnn.Ts+dSST.csv';
+
+const SOURCE = 'NASA GISS, GISTEMP surface temperature analysis (v4)';
 
 const tools: McpToolExport['tools'] = [
   {
@@ -1021,6 +1025,7 @@ const tools: McpToolExport['tools'] = [
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  R2 = args._r2 && typeof (args._r2 as R2Like).get === 'function' ? (args._r2 as R2Like) : null;
   switch (name) {
     case 'get_temperature_anomaly':
       return getTemperatureAnomaly(
@@ -1038,17 +1043,110 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   }
 }
 
-// Fetch + CF-cache. NASA updates these CSVs monthly; 6h edge cache is
-// safe and dedupes identical queries across all users.
-async function fetchCsv(filename: string): Promise<string> {
+// ---------------------------------------------------------------------------
+// The stored copy (fleet #3733).
+//
+// NASA GISS refuses requests that leave from some Cloudflare data centres (HTTP 403;
+// 40 external refusals from 9 callers in 12 hours on 2026-10-27), so a call routed
+// through a refused region never had a first success for any cache to fall back on.
+// The tables are small, public domain (US federal) and change about once a month, so a
+// copy is kept in the shared R2 store (`climate/gistemp/`, five small objects plus a
+// manifest, none in git, none in the gateway bundle) by scripts/refresh-gistemp.mjs,
+// run from a US machine. The gateway hands the pack its R2 binding (manifest injectR2).
+//
+// Order: stored copy if fresh -> the agency if the copy is older than STALE_AFTER_MS or
+// absent -> the stale copy, labelled, if the agency refuses. Every response carries
+// served_from, data_as_of (latest observation month) and copy_refreshed_at.
+// ---------------------------------------------------------------------------
+
+type R2Like = { get(key: string): Promise<{ text(): Promise<string> } | null> };
+let R2: R2Like | null = null;
+
+const STORE = 'climate/gistemp';
+const STALE_AFTER_MS = 45 * 24 * 60 * 60 * 1000;
+const MEMO_TTL_MS = 10 * 60 * 1000;
+
+/** R2 object key for an upstream table (no '+' in keys). */
+export function storedName(filename: string): string {
+  return filename.replace(/\+/g, '_plus_').toLowerCase();
+}
+
+type Manifest = { refreshed_at: string; files?: Record<string, { retrieved_at?: string }> };
+let manifestMemo: { at: number; doc: Manifest | null } | null = null;
+const csvMemo = new Map<string, { at: number; text: string }>();
+
+async function r2Text(key: string): Promise<string | null> {
+  if (!R2 || typeof R2.get !== 'function') return null;
+  try {
+    const obj = await R2.get(`${STORE}/${key}`);
+    return obj ? await obj.text() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function storedManifest(): Promise<Manifest | null> {
+  if (manifestMemo && Date.now() - manifestMemo.at < MEMO_TTL_MS) return manifestMemo.doc;
+  let doc: Manifest | null = null;
+  try {
+    const raw = await r2Text('_manifest.json');
+    const d = raw ? (JSON.parse(raw) as Manifest) : null;
+    if (d && typeof d.refreshed_at === 'string' && Number.isFinite(Date.parse(d.refreshed_at))) doc = d;
+  } catch { /* unreadable manifest = no copy */ }
+  manifestMemo = { at: Date.now(), doc };
+  return doc;
+}
+
+async function storedCsv(filename: string): Promise<string | null> {
+  const key = storedName(filename);
+  const hit = csvMemo.get(key);
+  if (hit && Date.now() - hit.at < MEMO_TTL_MS) return hit.text;
+  const text = await r2Text(key);
+  if (!text || !/^Year\b/im.test(text)) return null;
+  csvMemo.set(key, { at: Date.now(), text });
+  return text;
+}
+
+async function liveCsv(filename: string): Promise<string> {
   const res = await pwFetch(`${BASE}/${filename}`, {
     cf: {
       cacheTtlByStatus: { '200-299': 21600, '400-499': 60, '500-599': 10 },
       cacheEverything: true,
     },
   } as RequestInit);
-  if (!res.ok) throw new Error(`NASA GISS ${filename} HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`NASA GISS HTTP ${res.status}`);
   return res.text();
+}
+
+interface Provenance {
+  served_from: 'stored-copy' | 'live' | 'stale-stored-copy';
+  copy_refreshed_at: string | null;
+  note?: string;
+}
+
+async function fetchCsv(filename: string): Promise<{ csv: string; prov: Provenance }> {
+  const m = await storedManifest();
+  const copy = m ? await storedCsv(filename) : null;
+  const age = m ? Date.now() - Date.parse(m.refreshed_at) : Infinity;
+  if (copy && m && age <= STALE_AFTER_MS) {
+    return { csv: copy, prov: { served_from: 'stored-copy', copy_refreshed_at: m.refreshed_at } };
+  }
+  try {
+    const csv = await liveCsv(filename);
+    return { csv, prov: { served_from: 'live', copy_refreshed_at: m?.refreshed_at ?? null } };
+  } catch (err) {
+    if (copy && m) {
+      return {
+        csv: copy,
+        prov: {
+          served_from: 'stale-stored-copy',
+          copy_refreshed_at: m.refreshed_at,
+          note: `The stored copy is ${Math.floor(age / 86_400_000)} days old (limit ${STALE_AFTER_MS / 86_400_000}) and NASA GISS could not be reached to check for a newer one (${(err as Error).message}); newer months may exist.`,
+        },
+      };
+    }
+    throw new Error(`${(err as Error).message}. No stored copy of this table is available to answer from.`);
+  }
 }
 
 // GISTEMP CSVs have ~2 header lines (region label + sources) then a column
@@ -1079,6 +1177,17 @@ function parseGistempTable(csv: string): {
   return { header, rows };
 }
 
+/** Latest observation in the table as YYYY-MM (or YYYY for annual-only tables). */
+function dataAsOf(rows: Array<{ year: number; values: Record<string, number | null> }>): string | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    for (let m = MONTH_COLS.length - 1; m >= 0; m--) {
+      if (rows[i].values[MONTH_COLS[m]] != null) return `${rows[i].year}-${String(m + 1).padStart(2, '0')}`;
+    }
+    if (Object.values(rows[i].values).some((v) => v != null)) return String(rows[i].year);
+  }
+  return null;
+}
+
 const MONTH_COLS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 async function getTemperatureAnomaly(
@@ -1095,7 +1204,7 @@ async function getTemperatureAnomaly(
       requested: region,
     };
   }
-  const csv = await fetchCsv(file);
+  const { csv, prov } = await fetchCsv(file);
   const { rows } = parseGistempTable(csv);
   const filtered = rows.filter((r) =>
     (startYear == null || r.year >= startYear) &&
@@ -1113,8 +1222,9 @@ async function getTemperatureAnomaly(
       region,
       frequency,
       baseline: '1951-1980',
-      source: 'NASA GISTEMP v4 (Goddard Institute for Space Studies)',
-      source_url: `${BASE}/${file}`,
+      source: SOURCE,
+      data_as_of: dataAsOf(rows),
+      ...prov,
       total: observations.length,
       observations,
     };
@@ -1129,8 +1239,9 @@ async function getTemperatureAnomaly(
     region,
     frequency: 'annual',
     baseline: '1951-1980',
-    source: 'NASA GISTEMP v4 (Goddard Institute for Space Studies)',
-    source_url: `${BASE}/${file}`,
+    source: SOURCE,
+    data_as_of: dataAsOf(rows),
+    ...prov,
     total: observations.length,
     observations,
   };
@@ -1145,7 +1256,7 @@ async function getLatestAnomaly(region: string) {
       requested: region,
     };
   }
-  const csv = await fetchCsv(file);
+  const { csv, prov } = await fetchCsv(file);
   const { rows } = parseGistempTable(csv);
   let latestYear: number | null = null;
   let latestMonth: number | null = null;
@@ -1197,13 +1308,14 @@ async function getLatestAnomaly(region: string) {
     same_month_observations: sameMonthValues.length,
     trailing_12_month_mean_c: trailing12,
     baseline: '1951-1980',
-    source: 'NASA GISTEMP v4',
-    source_url: `${BASE}/${file}`,
+    source: SOURCE,
+    data_as_of: dataAsOf(rows),
+    ...prov,
   };
 }
 
 async function getZonalAnomalies(startYear?: number, endYear?: number) {
-  const csv = await fetchCsv('ZonAnn.Ts+dSST.csv');
+  const { csv, prov } = await fetchCsv(ZONAL_FILE);
   const { header, rows } = parseGistempTable(csv);
   const bands = header.slice(1);
   const filtered = rows.filter((r) =>
@@ -1213,8 +1325,9 @@ async function getZonalAnomalies(startYear?: number, endYear?: number) {
   return {
     bands,
     baseline: '1951-1980',
-    source: 'NASA GISTEMP v4 (zonal annual)',
-    source_url: `${BASE}/ZonAnn.Ts+dSST.csv`,
+    source: `${SOURCE}, zonal annual means`,
+    data_as_of: dataAsOf(rows),
+    ...prov,
     total: filtered.length,
     observations: filtered.map((r) => ({
       year: r.year,
