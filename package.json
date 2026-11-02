@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gistemp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "GISTEMP MCP — NASA Goddard Institute for Space Studies Surface Temperature Analysis (free, no auth)",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "gistemp",
     "gatewaySlug": "gistemp",
-    "sourceHash": "v1-0568d6c1bdf8d087d4c1d2fd2e0be4d0a0add258c691451d2458cff12fe17b2c",
-    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
+    "sourceHash": "v1-6b98a3c13b523948639a44e2e160e001c8694dd8b4f02029405e6c14a5f9ea1b",
+    "sourceCommit": "030233f6b150a38a44421f88a5fcbad123f0fea8"
   }
 }
